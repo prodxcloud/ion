@@ -1,0 +1,119 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on any warning, not just on clippy's.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: build / test / clippy / fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --all
+
+      - name: Doc-tests
+        run: cargo test --doc
+
+      - name: Documentation builds without warnings
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps
+
+      - name: Self-test the built binary
+        run: ./target/release/ion selftest
+
+      - name: Version banner
+        run: ./target/release/ion --version
+
+  static:
+    name: static musl binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust with the musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      # `ring` (via rustls) compiles C. Point cc-rs at the system compiler;
+      # rustc supplies the self-contained musl CRT objects itself, so no
+      # musl cross-toolchain is needed.
+      - name: Build fully static binary
+        env:
+          CC_x86_64_unknown_linux_musl: gcc
+          AR_x86_64_unknown_linux_musl: ar
+          RUSTFLAGS: "-D warnings -C target-feature=+crt-static -C link-self-contained=yes"
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Prove it is static and it runs
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/ion
+          file "$BIN"
+          ldd "$BIN" || true
+          test -z "$(ldd "$BIN" 2>&1 | grep -v 'statically linked')" \
+            || { echo "binary is not statically linked"; exit 1; }
+          "$BIN" --version
+          "$BIN" selftest > /dev/null
+          echo "size: $(stat -c %s "$BIN") bytes"
+
+      - name: Measure peak RSS and in-process startup
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/ion
+          /usr/bin/time -v "$BIN" selftest 2>&1 >/dev/null | grep 'Maximum resident'
+          "$BIN" selftest --timing 2>&1 >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ion-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/ion
+          if-no-files-found: error
+
+  msrv:
+    name: minimum supported Rust version (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      # The declared `rust-version` is a promise; check that it holds. Only the
+      # library and binary are checked, because dev-dependency resolution can
+      # pull newer crates than the MSRV supports.
+      - name: cargo check
+        run: cargo check --lib --bins

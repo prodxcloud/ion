@@ -1,0 +1,80 @@
+[package]
+name = "ion"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Ultra-light VxCloud micro-worker: sub-millisecond cold start, hand-rolled RFC 2136 dynamic DNS, async HTTP/scrape engine."
+authors = ["ProdXCloud / VxCloud"]
+license = "Apache-2.0"
+repository = "https://github.com/prodxcloud/ion"
+homepage = "https://github.com/prodxcloud/ion"
+documentation = "https://docs.rs/ion"
+readme = "README.md"
+keywords = ["dns", "rfc2136", "worker", "serverless", "scraper"]
+categories = ["network-programming", "web-programming"]
+exclude = ["/.github", "/REQUIREMENTS.md"]
+
+[dependencies]
+# Async runtime. `rt-multi-thread` is compiled in but only *used* when the
+# operator opts in via VX_RUNTIME_MULTI_THREAD=1; the default is current-thread
+# so an idle worker keeps a single stack and a tiny RSS.
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "time",
+    "macros",
+    "signal",
+    "sync",
+    "io-util",
+    "io-std",
+    "fs",
+] }
+
+# HTTP/1.1 + HTTP/2 with rustls. `default-features = false` keeps OpenSSL and
+# every other system TLS library out of the dependency graph entirely.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "http2",
+    "gzip",
+] }
+
+# HTML parsing + CSS selector engine (pure Rust, html5ever/servo lineage).
+scraper = { version = "0.23", default-features = false }
+
+# RFC 8945 TSIG request signing. Pure Rust, no C crypto.
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+
+# Task payload codec.
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "net",
+    "time",
+    "macros",
+    "sync",
+    "io-util",
+] }
+
+# Footprint profile: every knob is pointed at "smallest resident image".
+#   opt-level = "z"      -> optimise for size, not speed
+#   lto = "fat"          -> whole-program LTO across all crates
+#   codegen-units = 1    -> maximum cross-unit inlining/dedup
+#   panic = "abort"      -> no landing pads, no unwind tables
+#   strip = true         -> no symbol table / debug info in the shipped image
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false
+overflow-checks = false
+
+[profile.dev]
+# Tests run in this profile; keep unwinding so `#[should_panic]`/assert work.
+opt-level = 0

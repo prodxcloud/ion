@@ -1,0 +1,29 @@
+# Rust build artefacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is intentionally committed: `ion` ships a binary, and a reproducible
+# dependency graph is part of the deliverable.
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local task frames and captured result frames
+*.bin
+*.out
+
+# Anything that could carry a real credential must never be committed.
+# TSIG secrets belong in VX_TSIG_SECRET, not in a file.
+.env
+.env.*
+*.key
+*.pem
+*.tsig
+tsig-*.conf

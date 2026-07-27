@@ -1,0 +1,11 @@
+# This project builds only on Linux.  Forcing LF in the working tree keeps the
+# Makefile and the shell scripts runnable when the repo is cloned on Windows —
+# a CRLF in a Makefile recipe or a shebang line is a silent, confusing failure.
+* text=auto eol=lf
+
+*.c   text eol=lf
+*.h   text eol=lf
+*.sh  text eol=lf
+*.yml text eol=lf
+*.md  text eol=lf
+Makefile text eol=lf
