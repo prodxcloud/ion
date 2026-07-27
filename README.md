@@ -323,6 +323,16 @@ The codec's contract:
   pattern panics any decoder.
 - **A lying header cannot cause a huge allocation.** `payload_len` is validated
   against the 16 MiB cap *before* anything is reserved.
+- **A truthful header cannot blow the memory budget either.** The ABI cap and
+  the RSS budget were specified independently and do not compose: RSS scales
+  with the inline payload, so a legal 16 MiB frame would breach 8 MiB. `ion`
+  therefore enforces its own *policy* ceiling, `VX_MAX_INLINE_PAYLOAD_BYTES`
+  (default 1 MiB, at most the ABI cap), at dispatch time — before the payload
+  is allocated. An over-ceiling frame gets a typed `VX_STATE_FAILED` /
+  `VX_ERR_PAYLOAD_TOO_LARGE` result naming both numbers; its bytes are drained
+  through a fixed 64 KiB scratch buffer and the stream continues, because a
+  valid header means the framing is intact and aborting would forfeit every
+  task queued behind the oversized one.
 
 Framing is implicit: a task frame is self-describing, so a stream is just
 `[header][payload][header][payload]…`. `dispatch_loop` stops cleanly at EOF on a
@@ -385,18 +395,23 @@ range across 3 sessions.
 | `ion selftest` (ABI + 4 DNS packets + TSIG sign + decode) | 4,224–4,352 KiB — **4.13–4.25 MiB** | 2,304–2,432 KiB — **2.25–2.38 MiB** |
 | `ion run`, 1 task (current-thread tokio **and** a live rustls HTTP client) | 4,864–4,992 KiB — **4.75–4.88 MiB** | 2,688 KiB — **2.63 MiB** |
 | `ion run`, 1,000 tasks streamed | 4,736–4,864 KiB — **4.63–4.75 MiB** | 2,816 KiB — **2.75 MiB** |
-| `ion run`, one 1 MiB inline payload | — | 4,480 KiB — **4.38 MiB** |
+| `ion run`, one 1 MiB inline payload (exactly at the default ceiling) | 6,656 KiB — **6.50 MiB** | 4,480–4,608 KiB — **4.38–4.50 MiB** |
 
-The static build's worst measured figure across every workload is **2.75 MiB**,
-about a third of the budget. Streaming 5,000 tasks does not move it, which is the
-point of the streaming reader: memory is bounded by the frame, not the stream.
+The static build's worst measured figure across the streaming workloads is
+**2.75 MiB**, about a third of the budget. Streaming 5,000 tasks does not move
+it, which is the point of the streaming reader: memory is bounded by the frame,
+not the stream.
 
 Two honest caveats:
 
-- **RSS scales with the inline payload**, because the ABI passes payloads inline.
-  A 1 MiB payload measured 4.38 MiB peak. The 16 MiB ABI ceiling would therefore
-  exceed the 8 MiB target; that is what the header's "pass larger payloads by
-  shared-memory handle" note is for.
+- **RSS scales with the inline payload**, because the ABI passes payloads
+  inline, so the ABI's 16 MiB `payload_len` cap and the 8 MiB RSS budget do not
+  compose — a maximal legal frame measured **20.6–22.5 MiB**. `ion` closes that
+  hole with a dispatch-time policy ceiling, `VX_MAX_INLINE_PAYLOAD_BYTES`
+  (default 1 MiB); the measured justification is the next subsection. Payloads
+  above the ceiling are refused with a typed result; bodies that genuinely need
+  to be bigger are what the header's "pass larger payloads by shared-memory
+  handle" note is for.
 - **The current-thread default did not measurably beat multi-thread here.**
   Measured on this 12-core host: `run` with `VX_RUNTIME_MULTI_THREAD=1` came out
   at 2,816 KiB (musl) versus 2,688 KiB for current-thread, and *identical* at
@@ -405,6 +420,45 @@ Two honest caveats:
   the default because it keeps the worker-thread spawn off the startup path and
   the virtual-memory reservation out of the accounting, but the honest RSS win is
   about 128 KiB, not the dramatic figure the design note might imply.
+
+### RSS vs. inline payload — why the ceiling defaults to 1 MiB
+
+One `{"op":"noop"}` task padded to the given payload size, `/usr/bin/time -v`,
+worst of 7 runs, single session. The **accepted** columns were measured with the
+ceiling raised to the ABI maximum (`VX_MAX_INLINE_PAYLOAD_BYTES=16777216`) so
+the payload really is read, parsed, and executed; the **rejected** columns are
+the same frames against the default 1 MiB ceiling.
+
+| Payload | accepted, glibc | accepted, musl | rejected (default ceiling), glibc | rejected, musl |
+|---|---|---|---|---|
+| 13 B (baseline) | 4,992 KiB — 4.88 MiB | 2,560 KiB — 2.50 MiB | — | — |
+| 4 KiB | 4,864 KiB — 4.75 MiB | 2,560 KiB — 2.50 MiB | — | — |
+| 256 KiB | 5,132 KiB — 5.01 MiB | 3,072 KiB — 3.00 MiB | — | — |
+| 1 MiB | 6,656 KiB — **6.50 MiB** | 4,608 KiB — **4.50 MiB** | accepted: at the limit | accepted: at the limit |
+| 2 MiB | 8,832 KiB — **8.63 MiB** | 6,656 KiB — 6.50 MiB | 5,120 KiB — 5.00 MiB | 2,688 KiB — 2.63 MiB |
+| 4 MiB | 10,752 KiB — 10.50 MiB | 8,832 KiB — 8.63 MiB | 5,120 KiB — 5.00 MiB | 2,688 KiB — 2.63 MiB |
+| 8 MiB | 14,848 KiB — 14.50 MiB | 12,928 KiB — 12.63 MiB | 4,992 KiB — 4.88 MiB | 2,688 KiB — 2.63 MiB |
+| 16 MiB (ABI max) | 23,040 KiB — 22.50 MiB | 21,120 KiB — 20.63 MiB | 4,992 KiB — 4.88 MiB | 2,688 KiB — 2.63 MiB |
+
+Three things fall out of the numbers:
+
+- **The relationship is piecewise linear, not linear.** Up to 2 MiB the
+  marginal cost is ~**2 MiB of RSS per 1 MiB of payload** — the payload buffer
+  itself plus `tokio::fs`'s blocking-pool copy of it, whose intermediate buffer
+  grows with the read up to its own 2 MiB cap. Beyond that the copy buffer
+  stays capped and the slope settles to ~1× payload + 2 MiB: for example,
+  16 MiB → 2.50 + 16 + 2 ≈ 20.6 MiB measured (musl).
+- **1 MiB is the largest power-of-two default that keeps every build inside
+  the budget.** At 1 MiB the worst build (glibc) peaks at 6.50 MiB, leaving
+  1.5 MiB of headroom; at 2 MiB it measures 8.63 MiB, already through the
+  8 MiB target. Deployments that only ship the musl build can raise the
+  ceiling to 2 MiB (6.50 MiB) or even 4 MiB (8.63 MiB, marginal) knowingly.
+- **Rejection really is flat.** A rejected frame's payload is drained through
+  a fixed 64 KiB scratch buffer, never allocated, so a 16 MiB frame against
+  the default ceiling costs the same 2.63 MiB (musl) as the baseline — the
+  budget now holds no matter what arrives on the wire. The oversized task gets
+  a typed `VX_STATE_FAILED` result naming both numbers, and the tasks behind
+  it still run.
 
 ### Cold start — target < 1 ms
 
@@ -763,6 +817,31 @@ result: task_id=101 state=3 (0x03 = VX_STATE_FAILED)
 payload: bad task payload: expected ident at line 1 column 2
 ```
 
+So does a frame whose payload exceeds the inline ceiling (here 2 MiB against
+the default 1 MiB): the payload is drained without ever being allocated, the
+result names both numbers, and any tasks behind it still run:
+
+```
+$ ion run --input big-task.bin --output big-result.bin
+ion: dispatched 1 task(s)
+
+result: task_id=1 state=3 (0x03 = VX_STATE_FAILED)
+        exit_code=-3 (VX_ERR_PAYLOAD_TOO_LARGE)
+        duration_us=2017 payload_len=128
+payload: inline payload is 2097152 bytes, which exceeds the configured ceiling
+         VX_MAX_INLINE_PAYLOAD_BYTES=1048576 (ABI maximum 16777216)
+```
+
+The same frame goes through when the operator raises the ceiling knowingly:
+
+```
+$ VX_MAX_INLINE_PAYLOAD_BYTES=4194304 ion run --input big-task.bin --output big-result.bin
+ion: dispatched 1 task(s)
+
+result: task_id=1 state=2 exit_code=0
+payload: {"op":"noop"}
+```
+
 ### Task payload schema
 
 ```json
@@ -799,6 +878,7 @@ Kubernetes `ConfigMap`. CLI flags override the environment.
 |---|---|---|
 | `VX_TENANT_ID` | `default` | tenant slug, ≤ 64 bytes |
 | `VX_TASK_ID` | `0` | task id used when the CLI synthesises a header |
+| `VX_MAX_INLINE_PAYLOAD_BYTES` | `1048576` | inline task payload ceiling (1 MiB); an over-ceiling frame gets a typed `VX_STATE_FAILED` result. At most 16 MiB — the ABI cap — and a value above it is a startup error |
 | `VX_DNS_ENABLED` | `0` | register an `A` record on boot |
 | `VX_DNS_SERVER` | `127.0.0.1:53` | authoritative server, literal `IP` or `IP:port` |
 | `VX_DNS_ZONE` | `vxcloud.io.` | zone named in the `UPDATE` zone section |
@@ -833,7 +913,7 @@ nothing panics.
 
 ```bash
 cargo build --release                       # dynamic, glibc
-cargo test --all                            # 139 tests
+cargo test --all                            # 145 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -880,14 +960,14 @@ Deliberately **not** dependencies: any DNS crate (the point of the exercise),
 $ cargo test --all
    Doc-tests ion
 
-test result: ok. 65 passed; 0 failed  (unit tests, src/)
+test result: ok. 71 passed; 0 failed  (unit tests, src/)
 test result: ok. 11 passed; 0 failed  (CLI parser, src/main.rs)
 test result: ok. 30 passed; 0 failed  (tests/abi_roundtrip.rs)
 test result: ok. 28 passed; 0 failed  (tests/dns_wire.rs)
 test result: ok.  5 passed; 0 failed  (doc-tests)
 ```
 
-**139 tests, 0 failures.** `cargo clippy --all-targets -- -D warnings`,
+**145 tests, 0 failures.** `cargo clippy --all-targets -- -D warnings`,
 `cargo fmt --check`, and `cargo doc` with `RUSTDOCFLAGS=-D warnings` are all clean.
 
 What is actually verified, as opposed to merely exercised:
@@ -921,6 +1001,13 @@ What is actually verified, as opposed to merely exercised:
 - **ABI.** Offsets asserted against a hand-assembled header; fields proved to
   tile the struct with no padding; every rejection path; a 4,096-round randomised
   sweep asserting no byte pattern panics any decoder.
+- **The inline-payload ceiling.** A payload exactly at the limit accepted; one
+  byte over refused with `VX_ERR_PAYLOAD_TOO_LARGE` and a body naming both the
+  size and the limit; a rejected payload larger than the drain buffer skipped
+  with the *next* frame still dispatched, proving the stream is not
+  desynchronised; EOF mid-drain surfacing as a truncated-stream error, not a
+  silent loss; the default (1 MiB), the env override, and the refusal of a
+  ceiling above the 16 MiB ABI cap all pinned by config tests.
 
 ---
 

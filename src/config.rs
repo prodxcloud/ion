@@ -25,6 +25,7 @@
 //! |---|---|---|
 //! | `VX_TENANT_ID` | `default` | tenant slug, <= 64 bytes |
 //! | `VX_TASK_ID` | `0` | task id used when the CLI synthesises a header |
+//! | `VX_MAX_INLINE_PAYLOAD_BYTES` | `1048576` | inline task payload ceiling; at most the 16 MiB ABI cap |
 //! | `VX_DNS_ENABLED` | `0` | register an `A` record on boot |
 //! | `VX_DNS_SERVER` | `127.0.0.1:53` | authoritative server to `UPDATE` |
 //! | `VX_DNS_ZONE` | `vxcloud.io.` | zone named in the `UPDATE` zone section |
@@ -49,7 +50,7 @@ use core::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use crate::abi::VX_TENANT_ID_LEN;
+use crate::abi::{VX_MAX_PAYLOAD_LEN, VX_TENANT_ID_LEN};
 use crate::dns::DNS_PORT;
 use crate::dns::tsig::{DEFAULT_FUDGE, TsigAlgorithm};
 
@@ -464,6 +465,20 @@ impl RuntimeConfig {
 // Top-level config
 // ---------------------------------------------------------------------------
 
+/// Default for `VX_MAX_INLINE_PAYLOAD_BYTES`: **1 MiB**.
+///
+/// The value is derived from measurement, not taste. Measured with
+/// `/usr/bin/time -v` (worst of 7 runs), accepting one task whose payload is
+/// the given size costs roughly **2 MiB of RSS per 1 MiB of payload** up to
+/// 2 MiB — the payload buffer plus `tokio::fs`'s blocking-pool copy of it —
+/// on top of a baseline of ~2.6 MiB (musl static) to ~4.9 MiB (glibc
+/// dynamic). At a 1 MiB payload the worst build peaks at **6.50 MiB**,
+/// inside the 8 MiB budget with margin; at 2 MiB it measures **8.63 MiB**,
+/// already past it. 1 MiB is therefore the largest power-of-two ceiling that
+/// keeps every supported build inside the budget. The full table lives in
+/// the README's "Measured performance" section.
+pub const DEFAULT_MAX_INLINE_PAYLOAD_BYTES: u64 = 1024 * 1024;
+
 /// The complete worker configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -471,6 +486,18 @@ pub struct Config {
     pub tenant_id: String,
     /// Task id used when the CLI has to synthesise an ABI header.
     pub task_id: u64,
+    /// Ceiling on the inline payload of a single task frame, in bytes.
+    ///
+    /// This is `ion` **policy**, not ABI: the wire format allows payloads up
+    /// to [`VX_MAX_PAYLOAD_LEN`] (16 MiB), but RSS scales with the inline
+    /// payload, so accepting a maximal frame would breach the ≤ 8 MiB memory
+    /// budget. A frame whose `payload_len` exceeds this value is answered
+    /// with a typed `VX_STATE_FAILED` result naming both numbers, its bytes
+    /// are drained without ever being allocated, and the stream continues.
+    ///
+    /// Configured by `VX_MAX_INLINE_PAYLOAD_BYTES`. A value above the ABI
+    /// maximum is a configuration error, not a licence to exceed the ABI.
+    pub max_inline_payload_bytes: u64,
     /// Dynamic-DNS settings.
     pub dns: DnsConfig,
     /// HTTP client settings.
@@ -502,6 +529,13 @@ impl Config {
         Ok(Self {
             tenant_id,
             task_id: read_u64(env, "VX_TASK_ID", 0, 0, u64::MAX)?,
+            max_inline_payload_bytes: read_u64(
+                env,
+                "VX_MAX_INLINE_PAYLOAD_BYTES",
+                DEFAULT_MAX_INLINE_PAYLOAD_BYTES,
+                1,
+                VX_MAX_PAYLOAD_LEN,
+            )?,
             dns: DnsConfig::from_env(env)?,
             http: HttpConfig::from_env(env)?,
             runtime: RuntimeConfig::from_env(env)?,
@@ -514,6 +548,7 @@ impl Default for Config {
         Self {
             tenant_id: "default".to_owned(),
             task_id: 0,
+            max_inline_payload_bytes: DEFAULT_MAX_INLINE_PAYLOAD_BYTES,
             dns: DnsConfig::default(),
             http: HttpConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -538,6 +573,11 @@ mod tests {
         let cfg = Config::from_env(&env(&[])).unwrap();
         assert_eq!(cfg.tenant_id, "default");
         assert_eq!(cfg.task_id, 0);
+        assert_eq!(cfg.max_inline_payload_bytes, 1024 * 1024);
+        assert_eq!(
+            cfg.max_inline_payload_bytes,
+            DEFAULT_MAX_INLINE_PAYLOAD_BYTES
+        );
         assert!(!cfg.dns.enabled);
         assert_eq!(cfg.dns.server.port(), 53);
         assert_eq!(cfg.dns.ttl, 60);
@@ -631,6 +671,35 @@ mod tests {
     fn base_domain_defaults_to_the_zone() {
         let cfg = Config::from_env(&env(&[("VX_DNS_ZONE", "internal.example.")])).unwrap();
         assert_eq!(cfg.dns.base_domain, "internal.example.");
+    }
+
+    #[test]
+    fn inline_payload_ceiling_overrides_and_refuses_to_exceed_the_abi_cap() {
+        // Override.
+        let cfg = Config::from_env(&env(&[("VX_MAX_INLINE_PAYLOAD_BYTES", "4096")])).unwrap();
+        assert_eq!(cfg.max_inline_payload_bytes, 4096);
+
+        // Exactly the ABI maximum is the largest legal value.
+        let at_max = VX_MAX_PAYLOAD_LEN.to_string();
+        let cfg = Config::from_env(&env(&[("VX_MAX_INLINE_PAYLOAD_BYTES", &at_max)])).unwrap();
+        assert_eq!(cfg.max_inline_payload_bytes, VX_MAX_PAYLOAD_LEN);
+
+        // One byte above the ABI maximum is a configuration error, not a
+        // licence to exceed the ABI.
+        let over = (VX_MAX_PAYLOAD_LEN + 1).to_string();
+        assert!(matches!(
+            Config::from_env(&env(&[("VX_MAX_INLINE_PAYLOAD_BYTES", &over)])),
+            Err(ConfigError::OutOfRange {
+                var: "VX_MAX_INLINE_PAYLOAD_BYTES",
+                ..
+            })
+        ));
+
+        // Zero would reject every payload-bearing task; it is refused too.
+        assert!(matches!(
+            Config::from_env(&env(&[("VX_MAX_INLINE_PAYLOAD_BYTES", "0")])),
+            Err(ConfigError::OutOfRange { .. })
+        ));
     }
 
     #[test]

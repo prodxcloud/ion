@@ -19,6 +19,26 @@
 //! as the payload, because a host waiting on a result must not be left waiting
 //! because a URL 404'd.
 //!
+//! ## The inline-payload ceiling
+//!
+//! The ABI permits `payload_len` up to 16 MiB, but peak RSS scales with the
+//! inline payload, so a maximal frame would blow `ion`'s ≤ 8 MiB memory
+//! budget. [`dispatch_loop`] therefore enforces a *policy* ceiling —
+//! [`Config::max_inline_payload_bytes`](crate::config::Config), env
+//! `VX_MAX_INLINE_PAYLOAD_BYTES`, default 1 MiB — after the header is decoded
+//! and **before** the payload is allocated.
+//!
+//! An over-ceiling frame is still structurally *valid* ABI, so the stream is
+//! not desynchronised: `payload_len` says exactly how many bytes to skip. The
+//! loop drains them through a fixed 64 KiB scratch buffer (the payload is
+//! never allocated), emits a [`TaskState::Failed`] result whose body names
+//! both the actual size and the configured limit, and **continues** with the
+//! next frame. Aborting instead would turn one oversized task into a lost
+//! result for every task queued behind it, which contradicts "failure is a
+//! result, not an error". A header that is structurally *invalid* — bad
+//! magic, or `payload_len` beyond the 16 MiB ABI cap — still aborts the
+//! stream, because past that point the framing itself cannot be trusted.
+//!
 //! ## Payload schema
 //!
 //! Payloads are JSON, tagged by `op`:
@@ -39,7 +59,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::abi::{
-    AbiError, ResultFrame, Task, TaskHeader, TaskState, VX_TASK_HEADER_SIZE, VxStatus,
+    AbiError, ResultFrame, Task, TaskHeader, TaskState, VX_MAX_PAYLOAD_LEN, VX_TASK_HEADER_SIZE,
+    VxStatus,
 };
 use crate::config::Config;
 use crate::dns::name::Name;
@@ -210,6 +231,14 @@ impl PageSummary {
 pub enum RuntimeError {
     /// The ABI frame was malformed.
     Abi(AbiError),
+    /// The frame was valid ABI but its payload exceeded the configured inline
+    /// ceiling (`VX_MAX_INLINE_PAYLOAD_BYTES`).
+    PayloadOverLimit {
+        /// The declared payload length in bytes.
+        len: u64,
+        /// The configured ceiling in bytes.
+        limit: u64,
+    },
     /// The payload was not the JSON the operation expects.
     BadPayload(String),
     /// A scrape operation failed.
@@ -242,6 +271,11 @@ impl core::fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Abi(e) => write!(f, "abi: {e}"),
+            Self::PayloadOverLimit { len, limit } => write!(
+                f,
+                "inline payload is {len} bytes, which exceeds the configured ceiling \
+                 VX_MAX_INLINE_PAYLOAD_BYTES={limit} (ABI maximum {VX_MAX_PAYLOAD_LEN})"
+            ),
             Self::BadPayload(r) => write!(f, "bad task payload: {r}"),
             Self::Scrape(r) => write!(f, "scrape: {r}"),
             Self::Dns(r) => write!(f, "dns: {r}"),
@@ -261,6 +295,7 @@ impl RuntimeError {
     pub const fn status(&self) -> VxStatus {
         match self {
             Self::Abi(e) => e.status(),
+            Self::PayloadOverLimit { .. } => VxStatus::PayloadTooLarge,
             Self::BadPayload(_) => VxStatus::InvalidArg,
             Self::Scrape(_) | Self::Dns(_) => VxStatus::InvalidArg,
             Self::Io { .. } | Self::TruncatedStream { .. } => VxStatus::RingEmpty,
@@ -302,11 +337,26 @@ impl Executor {
     ///
     /// Never returns an error: a failure becomes a [`TaskState::Failed`] frame
     /// whose payload is the error text.
+    ///
+    /// A payload larger than the configured inline ceiling
+    /// (`VX_MAX_INLINE_PAYLOAD_BYTES`) is refused *before* it is inspected and
+    /// becomes a [`TaskState::Failed`] frame naming both the actual size and
+    /// the limit. [`dispatch_loop`] enforces the same ceiling earlier, before
+    /// the payload is even read off the wire; this check covers callers that
+    /// hand a [`Task`] to the executor directly.
     pub async fn execute(&self, task: &Task<'_>) -> ResultFrame {
         let started = Instant::now();
         let task_id = task.task_id();
 
-        let outcome = self.run(task.payload).await;
+        let limit = self.cfg.max_inline_payload_bytes;
+        let outcome = if task.payload.len() as u64 > limit {
+            Err(RuntimeError::PayloadOverLimit {
+                len: task.payload.len() as u64,
+                limit,
+            })
+        } else {
+            self.run(task.payload).await
+        };
         let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
         match outcome {
@@ -508,6 +558,12 @@ pub fn encode_dns_packet(
 /// Returns the number of tasks dispatched. Stops cleanly when `input` reaches EOF
 /// on a frame boundary.
 ///
+/// A frame whose `payload_len` exceeds the configured inline ceiling is **not**
+/// an error at this level: its payload is drained without being allocated, a
+/// [`TaskState::Failed`] result naming both numbers is emitted, and the loop
+/// continues — see the module docs for why a framed stream continues rather
+/// than aborts.
+///
 /// # Errors
 /// - [`RuntimeError::Io`] on a read or write failure.
 /// - [`RuntimeError::TruncatedStream`] if EOF arrives mid-frame.
@@ -538,6 +594,32 @@ where
         }
 
         let header = TaskHeader::decode(&header_buf)?;
+
+        // Policy ceiling, distinct from the 16 MiB structural cap that
+        // `decode` just enforced. This must happen *before* the payload
+        // allocation below — rejecting after allocating would defeat the
+        // memory budget the ceiling exists to protect.
+        let limit = executor.config().max_inline_payload_bytes;
+        if header.payload_len > limit {
+            let started = Instant::now();
+            drain_exact(input, header.payload_len).await?;
+            let err = RuntimeError::PayloadOverLimit {
+                len: header.payload_len,
+                limit,
+            };
+            let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let frame = ResultFrame::new(
+                header.task_id,
+                TaskState::Failed,
+                err.status().code(),
+                duration_us,
+                err.to_string().into_bytes(),
+            );
+            write_frame(output, &frame).await?;
+            dispatched += 1;
+            continue;
+        }
+
         let payload_len = usize::try_from(header.payload_len).unwrap_or(usize::MAX);
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
@@ -563,21 +645,71 @@ where
             payload: &payload,
         };
         let frame = executor.execute(&task).await;
-        output
-            .write_all(&frame.encode())
-            .await
-            .map_err(|e| RuntimeError::Io {
-                context: "write result frame",
-                detail: e.to_string(),
-            })?;
-        output.flush().await.map_err(|e| RuntimeError::Io {
-            context: "flush result frame",
-            detail: e.to_string(),
-        })?;
+        write_frame(output, &frame).await?;
         dispatched += 1;
     }
 
     Ok(dispatched)
+}
+
+/// Write one result frame and flush it, so a supervisor blocking on the result
+/// sees it immediately.
+async fn write_frame<W: AsyncWrite + Unpin>(
+    output: &mut W,
+    frame: &ResultFrame,
+) -> Result<(), RuntimeError> {
+    output
+        .write_all(&frame.encode())
+        .await
+        .map_err(|e| RuntimeError::Io {
+            context: "write result frame",
+            detail: e.to_string(),
+        })?;
+    output.flush().await.map_err(|e| RuntimeError::Io {
+        context: "flush result frame",
+        detail: e.to_string(),
+    })
+}
+
+/// Scratch-buffer size for skipping a rejected payload: two reads per 128 KiB,
+/// and small enough to be irrelevant next to the memory budget.
+const DRAIN_CHUNK: usize = 64 * 1024;
+
+/// Read and discard exactly `len` bytes from `input`.
+///
+/// This is how an over-ceiling payload is skipped: through a fixed-size
+/// scratch buffer, so the peak allocation for a rejected frame is
+/// [`DRAIN_CHUNK`] no matter what `payload_len` claims — that bound is the
+/// whole point of rejecting at dispatch time.
+///
+/// # Errors
+/// - [`RuntimeError::Io`] on a read failure.
+/// - [`RuntimeError::TruncatedStream`] if EOF arrives before `len` bytes.
+async fn drain_exact<R: AsyncRead + Unpin>(input: &mut R, len: u64) -> Result<(), RuntimeError> {
+    let mut scratch = vec![0u8; DRAIN_CHUNK.min(usize::try_from(len).unwrap_or(DRAIN_CHUNK))];
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(scratch.len());
+        // `want <= scratch.len()` by construction; the `None` arm keeps the
+        // function panic-free without an `unwrap`.
+        let Some(slice) = scratch.get_mut(..want) else {
+            break;
+        };
+        let n = input.read(slice).await.map_err(|e| RuntimeError::Io {
+            context: "drain oversized payload",
+            detail: e.to_string(),
+        })?;
+        if n == 0 {
+            return Err(RuntimeError::TruncatedStream {
+                need: usize::try_from(len).unwrap_or(usize::MAX),
+                got: usize::try_from(len - remaining).unwrap_or(usize::MAX),
+            });
+        }
+        remaining = remaining.saturating_sub(n as u64);
+    }
+    Ok(())
 }
 
 /// How a framed read ended.
@@ -763,6 +895,151 @@ mod tests {
             dispatch_loop(&mut input, &mut output, &executor).await,
             Err(RuntimeError::TruncatedStream { .. })
         ));
+    }
+
+    /// A config whose only non-default setting is the inline-payload ceiling.
+    fn ceiling_config(limit: u64) -> Config {
+        Config {
+            max_inline_payload_bytes: limit,
+            ..Config::default()
+        }
+    }
+
+    /// `{"op":"noop"}` padded with trailing spaces (legal JSON) to exactly
+    /// `len` bytes, so the payload is both size-controlled and executable.
+    fn padded_noop(len: usize) -> Vec<u8> {
+        let mut payload = br#"{"op":"noop"}"#.to_vec();
+        assert!(len >= payload.len(), "cannot pad down to {len}");
+        payload.resize(len, b' ');
+        payload
+    }
+
+    #[tokio::test]
+    async fn a_payload_exactly_at_the_ceiling_is_accepted() {
+        let executor = Executor::new(ceiling_config(64)).expect("executor");
+        let bytes = frame(21, &padded_noop(64));
+        let mut input: &[u8] = &bytes;
+        let mut output: Vec<u8> = Vec::new();
+
+        let count = dispatch_loop(&mut input, &mut output, &executor)
+            .await
+            .expect("dispatch");
+        assert_eq!(count, 1);
+
+        let result = ResultFrame::decode(&output).expect("result");
+        assert_eq!(result.header.task_id, 21);
+        assert_eq!(result.header.state().unwrap(), TaskState::Completed);
+    }
+
+    #[tokio::test]
+    async fn one_byte_over_the_ceiling_is_rejected_and_the_stream_continues() {
+        let executor = Executor::new(ceiling_config(64)).expect("executor");
+        let mut bytes = frame(22, &padded_noop(65));
+        bytes.extend_from_slice(&frame(23, br#"{"op":"noop"}"#));
+        let mut input: &[u8] = &bytes;
+        let mut output: Vec<u8> = Vec::new();
+
+        let count = dispatch_loop(&mut input, &mut output, &executor)
+            .await
+            .expect("dispatch");
+        assert_eq!(count, 2, "the rejected frame still counts as dispatched");
+
+        // First frame: a typed failure naming both numbers, not a panic and
+        // not a stream error.
+        let rejected = ResultFrame::decode(&output).expect("rejected frame");
+        assert_eq!(rejected.header.task_id, 22);
+        assert_eq!(rejected.header.state().unwrap(), TaskState::Failed);
+        assert_eq!(
+            rejected.header.exit_code,
+            VxStatus::PayloadTooLarge.code(),
+            "the host must see VX_ERR_PAYLOAD_TOO_LARGE, not a generic failure"
+        );
+        let text = String::from_utf8_lossy(&rejected.payload);
+        assert!(text.contains("inline payload is 65 bytes"), "got {text}");
+        assert!(
+            text.contains("VX_MAX_INLINE_PAYLOAD_BYTES=64"),
+            "the body must name the configured limit, got {text}"
+        );
+
+        // Second frame: the stream was not desynchronised by the rejection.
+        let offset = VX_RESULT_HEADER_SIZE + rejected.payload.len();
+        let next = ResultFrame::decode(output.get(offset..).expect("slice")).expect("next frame");
+        assert_eq!(next.header.task_id, 23);
+        assert_eq!(next.header.state().unwrap(), TaskState::Completed);
+        assert_eq!(
+            offset + VX_RESULT_HEADER_SIZE + next.payload.len(),
+            output.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_payload_larger_than_the_drain_buffer_is_fully_skipped() {
+        // 200 KiB payload against a 16-byte ceiling: the drain path has to
+        // loop through its 64 KiB scratch buffer several times and stop on
+        // exactly the right byte for the following frame to decode.
+        let executor = Executor::new(ceiling_config(16)).expect("executor");
+        let big = vec![b'x'; 200 * 1024];
+        let mut bytes = frame(31, &big);
+        bytes.extend_from_slice(&frame(32, br#"{"op":"noop"}"#));
+        let mut input: &[u8] = &bytes;
+        let mut output: Vec<u8> = Vec::new();
+
+        let count = dispatch_loop(&mut input, &mut output, &executor)
+            .await
+            .expect("dispatch");
+        assert_eq!(count, 2);
+
+        let rejected = ResultFrame::decode(&output).expect("rejected frame");
+        assert_eq!(rejected.header.task_id, 31);
+        assert_eq!(rejected.header.state().unwrap(), TaskState::Failed);
+        let text = String::from_utf8_lossy(&rejected.payload);
+        assert!(
+            text.contains(&format!("{} bytes", 200 * 1024)),
+            "got {text}"
+        );
+
+        let offset = VX_RESULT_HEADER_SIZE + rejected.payload.len();
+        let next = ResultFrame::decode(output.get(offset..).expect("slice")).expect("next frame");
+        assert_eq!(next.header.task_id, 32);
+        assert_eq!(next.header.state().unwrap(), TaskState::Completed);
+    }
+
+    #[tokio::test]
+    async fn an_over_ceiling_frame_truncated_mid_payload_is_still_a_stream_error() {
+        // Losing an oversized task silently would be as bad as losing a normal
+        // one: EOF while draining must surface as TruncatedStream.
+        let executor = Executor::new(ceiling_config(16)).expect("executor");
+        let full = frame(33, &vec![b'y'; 4096]);
+        let cut = full.len() - 100;
+        let mut input: &[u8] = full.get(..cut).expect("prefix");
+        let mut output: Vec<u8> = Vec::new();
+        assert!(matches!(
+            dispatch_loop(&mut input, &mut output, &executor).await,
+            Err(RuntimeError::TruncatedStream { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_an_over_ceiling_payload_without_running_it() {
+        // Nine bytes of non-JSON against an 8-byte ceiling: if the ceiling
+        // check were missing, this would fail as BadPayload (InvalidArg).
+        // Seeing PayloadTooLarge proves the payload was refused *before* it
+        // was inspected.
+        let executor = Executor::new(ceiling_config(8)).expect("executor");
+        let header = TaskHeader::new(41, "acme", Engine::Ion, 8, 100_000, 9).expect("header");
+        let payload = vec![b'x'; 9];
+        let task = Task {
+            header,
+            payload: &payload,
+        };
+
+        let result = executor.execute(&task).await;
+        assert_eq!(result.header.task_id, 41);
+        assert_eq!(result.header.state().unwrap(), TaskState::Failed);
+        assert_eq!(result.header.exit_code, VxStatus::PayloadTooLarge.code());
+        let text = String::from_utf8_lossy(&result.payload);
+        assert!(text.contains("inline payload is 9 bytes"), "got {text}");
+        assert!(text.contains("VX_MAX_INLINE_PAYLOAD_BYTES=8"), "got {text}");
     }
 
     #[tokio::test]

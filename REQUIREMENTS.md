@@ -8,7 +8,7 @@ Verified on WSL2 (kernel 6.6.87.2, x86_64, 12th Gen Intel Core i5-12450H,
 12 cores, glibc 2.39) with Rust 1.97.1.
 
 ```
-cargo test --all                             139 passed, 0 failed
+cargo test --all                             145 passed, 0 failed
 cargo clippy --all-targets -- -D warnings    clean
 cargo fmt --check                            clean
 cargo doc --no-deps  (RUSTDOCFLAGS=-D …)     clean
@@ -210,19 +210,61 @@ Worst of 7 runs per session, `/usr/bin/time -v`:
 | `run`, 1,000 tasks streamed | 4.63–4.75 MiB | **2.75 MiB** |
 | `run`, 5,000 tasks streamed | — | **2.75 MiB** (unchanged: bounded by the frame) |
 
-Worst figure anywhere for the static build: **2.75 MiB**, roughly a third of the
-budget.
+Worst figure anywhere for the static build on the streaming workloads:
+**2.75 MiB**, roughly a third of the budget.
 
 Honestly reported caveats:
 
-- A 1 MiB inline payload pushes peak RSS to **4.38 MiB**; RSS scales with the
-  payload because the ABI passes it inline. The 16 MiB ABI ceiling would exceed
-  the 8 MiB target, which is what the header's shared-memory-handle note is for.
 - The current-thread default did **not** measurably beat multi-thread on this
   12-core host: 2,688 KiB versus 2,816 KiB (musl), and identical at 4,864–4,992
   KiB (glibc). Thread stacks are lazily faulted, so 11 idle workers cost little
   resident memory on a workload this short. Current-thread stays the default for
   startup latency, but the honest RSS win is ~128 KiB, not dramatic.
+
+### The inline-payload ceiling — the ABI/budget composition hole, now closed
+
+- [x] RSS scales with the inline payload, so the ABI's 16 MiB `payload_len`
+      cap and the 8 MiB RSS budget do not compose. `ion` now enforces
+      `VX_MAX_INLINE_PAYLOAD_BYTES` (default **1 MiB**, clamped to the ABI cap
+      — a larger value is a startup `ConfigError`, not a licence to exceed the
+      ABI) at dispatch time, *before* the payload is allocated
+- [x] An over-ceiling frame is answered with a typed `VX_STATE_FAILED` /
+      `VX_ERR_PAYLOAD_TOO_LARGE` result naming both the actual size and the
+      limit; its bytes are drained through a fixed 64 KiB scratch buffer —
+      never allocated — and the stream **continues**, because the header was
+      valid ABI so the framing is intact, and aborting would forfeit every
+      task queued behind the oversized one
+      (`one_byte_over_the_ceiling_is_rejected_and_the_stream_continues`,
+      `a_payload_exactly_at_the_ceiling_is_accepted`,
+      `a_rejected_payload_larger_than_the_drain_buffer_is_fully_skipped`,
+      `an_over_ceiling_frame_truncated_mid_payload_is_still_a_stream_error`,
+      `execute_rejects_an_over_ceiling_payload_without_running_it`,
+      `inline_payload_ceiling_overrides_and_refuses_to_exceed_the_abi_cap`)
+
+Measured (one padded-noop task, `/usr/bin/time -v`, worst of 7 runs; "accepted"
+= ceiling raised to the ABI max so the payload is really read and parsed,
+"rejected" = the same frame against the default 1 MiB ceiling):
+
+| Payload | accepted glibc | accepted musl | rejected glibc | rejected musl |
+|---|---|---|---|---|
+| 13 B | 4.88 MiB | 2.50 MiB | — | — |
+| 4 KiB | 4.75 MiB | 2.50 MiB | — | — |
+| 256 KiB | 5.01 MiB | 3.00 MiB | — | — |
+| 1 MiB | **6.50 MiB** | **4.50 MiB** | at the limit: accepted | at the limit: accepted |
+| 2 MiB | 8.63 MiB | 6.50 MiB | 5.00 MiB | 2.63 MiB |
+| 4 MiB | 10.50 MiB | 8.63 MiB | 5.00 MiB | 2.63 MiB |
+| 8 MiB | 14.50 MiB | 12.63 MiB | 4.88 MiB | 2.63 MiB |
+| 16 MiB | 22.50 MiB | 20.63 MiB | 4.88 MiB | 2.63 MiB |
+
+The relationship is **piecewise linear, not linear**: ~2 MiB of RSS per 1 MiB
+of payload up to 2 MiB (payload buffer + `tokio::fs`'s blocking-pool copy,
+whose buffer grows with the read until its own 2 MiB cap), settling to
+~1× + 2 MiB beyond. The default is 1 MiB because that is the largest
+power-of-two at which the *worst* build stays inside the budget: 6.50 MiB at
+1 MiB, 8.63 MiB — a breach — at 2 MiB. Rejection is flat: a 16 MiB frame
+against the default ceiling costs baseline + the 64 KiB drain buffer
+(2.63 MiB musl), so the budget now holds regardless of what arrives on the
+wire.
 
 ### Cold start — target < 1 ms: **MET by the static build; MISSED by the dynamic build**
 
@@ -285,7 +327,7 @@ cold-start figure above is measured).
 
 ## 8. Tests
 
-- [x] `cargo test --all` green — **139 passed, 0 failed**
+- [x] `cargo test --all` green — **145 passed, 0 failed**
 - [x] Golden hex vectors for a full `UPDATE` add and delete, asserting exact bytes
       — and five more: delete-RRset, delete-every-RRset, prerequisite+add,
       `AAAA`, `CNAME`
@@ -309,12 +351,12 @@ Test count by target:
 
 | Target | Tests |
 |---|---|
-| `src/` unit tests | 65 |
+| `src/` unit tests | 71 |
 | `src/main.rs` CLI parser and path resolution | 11 |
 | `tests/abi_roundtrip.rs` | 30 |
 | `tests/dns_wire.rs` | 28 |
 | doc-tests | 5 |
-| **total** | **139** |
+| **total** | **145** |
 
 ---
 
@@ -388,9 +430,16 @@ Things a reader might reasonably expect that are **not** here:
 3. **TCP fallback for DNS.** `UPDATE` over TCP (RFC 2136 §6) is unimplemented.
    Only relevant for a packet over the UDP limit, which `ion` cannot produce.
 4. **TSIG multi-message / TKEY / GSS-TSIG.** Single-message signing only.
-5. **Payloads above ~4 MiB keep RSS under 8 MiB only if the host uses a
-   shared-memory handle** rather than the inline path. `ion` implements the
-   inline path defined by the ABI; the handle path is not in the v1 header.
+5. **Payloads above the inline ceiling are refused, not processed.** The
+   budget hole this used to be — RSS scales with the inline payload, so a
+   legal 16 MiB frame breached the 8 MiB target — is closed: frames above
+   `VX_MAX_INLINE_PAYLOAD_BYTES` (default 1 MiB, measured justification in
+   item 6) now get a typed `VX_STATE_FAILED` result and are drained without
+   allocation. What remains true is that `ion` cannot *execute* a payload
+   bigger than the ceiling: the shared-memory handle path the ABI header
+   alludes to for large bodies is not in the v1 header, so raising the ceiling
+   (at most to the 16 MiB ABI cap, trading budget for capacity) is the only
+   inline option.
 6. **Windows and macOS are unverified.** The code compiles conditionally for
    non-Unix (signal handling falls back to `ctrl_c()`), but nothing was run there.
 7. **No benchmark harness in-tree.** The numbers above were produced by shell
